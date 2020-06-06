@@ -1,0 +1,906 @@
+---
+title: "Datos Omicos PEC2"
+author: "Eva Mª Ruiz Macias"
+date:  '`r format(Sys.Date(),"%e de %B, %Y")`'
+output:
+  word_document:
+    toc: yes
+  html_document:
+    code_folding: show
+    theme: journal
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load_libraries, include=FALSE}
+require(knitr)
+require(kableExtra)
+require(Biobase)
+require(BiocGenerics)
+require(ggplot2)
+require(gplots)
+require(limma)
+require(Glimma)
+require(edgeR)
+require(stringr)
+require(DESeq)
+require(DESeq2)
+require(RColorBrewer)
+require(org.Hs.eg.db)
+require(goseq)
+require(GO.db)
+require(dplyr)
+
+```
+
+```{r, include=FALSE}
+options(tinytex.verbose = TRUE)
+```
+
+# Introduccion
+
+En este trabajo veremos como analizar los datos de conteo de RNA-seq usando el paquete R, y más concretamente edgeR. Los puntos que se tocaran van desde la lectura de los datos en R, hasta el control de calidad, la realización de análisis de expresión diferencial y pruebas de conjuntos de genes.
+
+Los resultados de este trabajo se pueden encontrar en:
+
+<https://github.com/Tortufuriaperru/PEC2DatosOmicos.git>
+
+# Objetivos
+
+Se analizaran  los datos de expresion de tejido tiroideo de diferentes tipos: sin infiltración linfoidea, con pequeñas infiltraciones focales, y con infiltración linfoide extensa siguiendo los pasos mencionados anteriormente.
+
+# Materiales y métodos
+
+## Naturaleza de los datos
+
+Para este trabajo contamos con dos archivos de datos llamados targets y counts que contienen la información de las muestras de un estudio obtenido del repositorio GTEx.
+
+Dicho repositorio contiene datos de múltiples tipos en un total de 54 tejidos. En este trabajo utilizaremos los datos de expresión (RNA-seq) pertenecientes a un análisis del tiroides, en donde se compararan tres tipos de infiltración.
+
+
+
+## Metodos para el analisis
+
+
+### Identificación de grupos y quien pertenece a cada muestra.
+
+En el archivo original contamos con 292 muestras de los siguientes tipos
+
+* Not infiltrated tissues (NIT): 236 samples
+* Small focal infiltrates (SFI): 42 samples
+* Extensive lymphoid infiltrates (ELI): 14 samples.
+
+Nos quedaremos con 10 muestras de cada grupo, que se mostraran posteriormente.
+
+### Lectura de datos y selección de muestra
+
+Procedemos a leer los archivos facilitados, y a seleccionar 10 muestras de cada tipo (30 en total):
+
+```{r, echo=TRUE, eval=TRUE}
+targets <-  read.csv("C:/PEC2DatosOmicos/data/targets.csv", header = TRUE)
+counts <-  read.csv2("C:/PEC2DatosOmicos/data/counts.csv", header = TRUE, sep = ";")
+```
+
+Seleccionamos la muestra de la siguiente forma:
+
+```{r, echo=TRUE, eval=TRUE}
+
+set.seed(321, sample.kind = "Rounding")
+```
+
+
+```{r, echo=TRUE, eval=TRUE}
+# muestras de tamaño 10 por grupo
+
+targetsample <- targets%>%group_by(Group)%>%sample_n(size = 10, replace=F)
+
+# desactivo el paquete para que no me de problemas despues
+
+detach("package:dplyr", unload = TRUE)
+
+# nos quedamos con los elementos seleccionados
+
+seleccion <- c(targetsample$Sample_Name)
+
+# ahora nos quedamos con los elementos que ocupan la misma posicion en el
+# archivo counts quitando la variable X
+selectcounts <- counts[2:293][seleccion]
+selectcounts <- subset(counts[2:293], select=seleccion)
+# pasamos los nombres de los genes de la variable X a los nombres de las filas
+rownames(selectcounts) <- counts$X
+# quitamos los puntos de los nombres de las columnas para su tratamiento
+# posterior
+
+rownames(selectcounts) <- gsub("\\..*", "", rownames(selectcounts),
+                                fixed = FALSE)
+head(rownames(selectcounts))
+grupos <- rep(c("ELI", "NIT", "SFI"), each=10)
+
+#head(selectcounts,3)
+dim(selectcounts)
+```
+
+### Instalación de paquetes R
+
+El analisis se ha hecho utilizando el programa R y los paquetes necesarios para dicho analisis son los siguientes:
+
+require(knitr)
+
+require(kableExtra)
+
+require(ggplot2)
+
+require(gplots)
+
+require(limma)
+
+require(Glimma)
+
+require(edgeR)
+
+require(stringr)
+
+require(DESeq)
+
+require(DESeq2)
+
+require(RColorBrewer)
+
+require(org.Hs.eg.db)
+
+require(goseq)
+
+require(GO.db)
+
+require(dplyr)
+
+### Formato de los datos
+
+edgeR funciona con tablas de recuentos de lecturas de enteros, donde las filas correspondien a genes y las columnas a muestras independientes.
+
+Se almacenaran los datos en un objeto de datos basado en listas llamado DGEList.
+
+Este tipo de objeto es fácil de usar porque puede manipularse como cualquier lista en R. 
+
+```{r, echo=TRUE, eval=TRUE}
+grupos <- rep(c("ELI", "NIT", "SFI"), each=10)
+# Creamos el objeto dGEList
+dgList <- DGEList(selectcounts, group=grupos)
+# Mostramos los datos
+head(dgList, 2)
+names(dgList)
+dgList$samples
+```
+
+
+
+### Filtrado para eliminar genes poco expresados
+
+Los genes con recuentos muy bajos en todas las bibliotecas proporcionan poca evidencia de expresión diferencial e interfieren con algunas de las aproximaciones estadísticas que se utilizaran más adelante. También se suman a la carga de las pruebas múltiples al estimar las tasas de falsas, reduciendo el poder de detectar genes expresados diferencialmente. Estos genes deben filtrarse antes de un análisis posterior.
+
+
+Hay algunas formas de filtrar los genes poco expresados. En este conjunto de datos, elegimos retener genes si se expresan en un recuento por millón (CPM) superior a 0,5 en al menos dos muestras.
+
+Utilizaremos la función cpm de la biblioteca edgeR para generar los valores de CPM y luego filtrarlos. Hay que tener en cuenta que al convertir a CPM estamos normalizando las diferentes profundidades de secuencia para cada muestra.
+
+```{r, echo=TRUE, eval=TRUE}
+countsPerMillion <- cpm(dgList)
+summary(countsPerMillion)
+# valores mayores que 0.5
+countCheck <- countsPerMillion > 0.5
+# Esto produce una salida con valores logicos TRUEs y FALSEs
+head(countCheck, 2)
+# Cuantos trues hay en cada fila
+table(rowSums(countCheck))
+# Nos quedamos con los que tengan al menos 2 TRUES
+keep <- which(rowSums(countCheck) >= 2)
+dgList <- dgList[keep,]
+summary(cpm(dgList))
+dim(dgList)
+```
+
+Esto reduce el conjunto de datos de 56202 genes a  22002. Para los genes filtrados, hay muy poca potencia para detectar la expresión diferencial, por lo que el filtrado pierde poca información.
+
+
+### Control de calidad
+
+Una vez filtrados los genes con poca expresión y almacenados los datos en el objeto que hemos creado, veamos la calidad de los datos.
+
+Primero, podemos verificar cuántas lecturas tenemos para cada muestra:
+
+```{r, echo=TRUE, eval=TRUE}
+
+dgList$samples$lib.size
+```
+
+
+Hay que tener en cuenta que el  “size factor” de DSeq no es igual que “norm factor” de edgeR. 
+
+También podemos trazar los tamaños de la biblioteca como un diagrama de barras para ver si hay más discrepancias entre las muestras más fácilmente
+
+```{r, echo=TRUE, eval=TRUE}
+barplot(dgList$samples$lib.size, names=colnames(dgList), las=2)
+abline(h=20e6, lty=2)
+```
+
+Los datos de recuento no se distribuyen normalmente.  Vamos a hacer diagramas de cajas para verificar la distribución de los recuentos de lectura en la escala log2. Podemos usar la funcion cpm para obtener recuentos de log2 por millón, que se corrigen para los diferentes tamaños de biblioteca. La funcion cpmf también agrega un pequeño desplazamiento para evitar tomar el registro de cero.
+
+
+```{r, echo=TRUE, eval=TRUE}
+boxplot(cpm(dgList, log = TRUE), xlab="", ylab="Log2 counts por millon",las=2)
+# Añadimos la mediana logCPM en color azul
+abline(h=median(cpm(dgList, log = TRUE)),col="blue")
+title("Boxplots de logCPMs (sin normalizar)")
+```
+
+De los diagramas de caja vemos que, en general, las distribuciones de densidad de las intensidades logarítmicas en bruto no son idénticas pero tampoco muy diferentes.
+
+
+Un MDSplot es una visualización de un análisis de componentes principales, que determina las mayores fuentes de variación en los datos.Muestra distancias, en términos de coeficiente de variación biológica (BCV), entre muestras.
+
+Un análisis de componentes principales es un ejemplo de un análisis no supervisado, donde no necesitamos especificar los grupos. Si el experimento está bien controlado y ha funcionado bien, lo que esperamos ver es que las mayores fuentes de variación en los datos son los grupos en los que estamos interesados. También es una herramienta muy útil para el control de calidad y la comprobación de valores atípicos. Podemos usar la funcion plotMDS para crear el diagrama MDS.
+
+
+```{r, echo=TRUE, eval=TRUE}
+plotMDS(dgList, labels=dgList$samples$group,
+        cex=0.75,
+        xlim=c(-4, 5),
+        col=as.numeric(dgList$samples$group))
+legend("bottomleft", as.character(unique(dgList$samples$group)),
+       col=1:3,
+       pch=20,
+       cex = 0.5)
+```
+
+Otra alternativa es generar un diagrama MDS interactivo utilizando el paquete Glimma . Esto permite explorar interactivamente las diferentes dimensiones.
+
+```{r, echo=TRUE, eval=TRUE}
+glMDSPlot(dgList, groups=grupos, folder="mds")
+```
+
+
+```{r , echo=FALSE, fig.cap="Diagrama MDS interactivo", out.width = '100%'}
+knitr::include_graphics("C:/Pec2DatosOmicos/results/Glima1.png")
+```
+
+
+La salida de glMDSPlot es una página html que muestra el diagrama MDS a la izquierda y la cantidad de variación explicada por cada dimensión en un diagrama de barras a la derecha. Podemos desplazarnos sobre los puntos para encontrar información de la muestra y cambiar entre dimensiones sucesivas en el diagrama MDS haciendo clic en las barras del diagrama de barras.
+
+```{r, echo=TRUE, eval=FALSE}
+logcounts <- cpm(dgList, log=TRUE)
+
+```
+
+
+### Normalización de los datos
+
+La función calcNormFactors de edgeR calcula los factores de normalización entre bibliotecas.
+
+```{r, echo=TRUE, eval=TRUE}
+dgList <- calcNormFactors(dgList, method="TMM")
+
+```
+
+Esto actualizará los factores de normalización del objeto dgList (sus valores predeterminados son 1). veamos los factores de normalización para las muestras.
+
+
+Los factores de normalización multiplican a la unidad en todas las bibliotecas. Un factor de normalización por debajo de uno indica que el tamaño de la biblioteca se reducirá, ya que hay más supresión (es decir, sesgo de composición) en esa biblioteca en relación con las otras bibliotecas. Esto también es equivalente a escalar los recuentos hacia arriba en esa muestra. Por el contrario, un factor superior a uno aumenta el tamaño de la biblioteca y es equivalente a reducir los recuentos.
+
+
+La muestra GTEX.11DXX.0226.SM.5P9HL tiene el factor de normalización más pequeño, y GTEX.13NZ9.1126.SM.5MR37 tiene el más grande. Si trazamos gráficas de diferencia de medias usando la función plotMD para estas muestras, deberíamos poder ver el problema de sesgo de composición. Usaremos el logcounts, que se ha normalizado para el tamaño de la biblioteca, pero no para el sesgo de composición.
+
+```{r, echo=TRUE, eval=TRUE}
+logcounts <- cpm(dgList,log=TRUE)
+
+par(mfrow=c(1,2))
+plotMD(logcounts,column = 5)
+abline(h=0,col="grey")
+plotMD(logcounts,column = 14)
+abline(h=0,col="grey")
+```
+
+Los gráficos de diferencia de medias muestran la expresión promedio (media: eje x) frente a log-fold-changes (diferencia: eje y).
+Veamos las graficas con dgList:
+
+```{r, echo=TRUE, eval=TRUE}
+par(mfrow=c(1,2))
+plotMD(dgList,column = 5)
+abline(h=0,col="grey")
+plotMD(dgList,column = 14)
+abline(h=0,col="grey")
+
+```
+
+```{r, echo=TRUE, eval=FALSE}
+save(grupos,dgList,file="C:/Pec2DatosOmicos/results/preprocessing.Rdata")
+```
+
+
+### Expresión diferencial
+
+#### Estimación de la dispersión
+
+Un paso importante en el análisis de los datos DGE utilizando el modelo NB es estimar el parámetro de dispersión para cada etiqueta, una medida del grado de variación entre bibliotecas. La estimación de la dispersión común da una idea de la variabilidad general a través del genoma para el conjunto de datos.
+
+Aquí vamos a hacer la estimación suponiendo que todo tiene la misma dispersión común:
+
+```{r, echo=TRUE, eval=TRUE}
+d1 <- estimateCommonDisp(dgList, verbose=T)
+names(d1)
+```
+
+Para el análisis de expresión diferencial, vamos a utilizar dispersiones empíricas de Bayes. Hay que tener en cuenta que es necesario estimar la dispersión común antes de estimar las dispersiones por etiquetas.
+
+```{r, echo=TRUE, eval=TRUE}
+d1 <- estimateTagwiseDisp(d1)
+names(d1)
+```
+
+
+La función plotBCV() traza el coeficiente de variación biológica a nivel de etiqueta (raíz cuadrada de dispersiones) frente a log2-CPM.
+
+```{r, echo=TRUE, eval=TRUE}
+plotBCV(d1)
+
+```
+
+Podemos ver que una sola estimación del coeficiente de variación no es un buen modelo, ya que la dispersión aumenta a medida que aumenta el recuento por millón (CPM).
+
+Ahora calcularemos las estimaciones de dispersión con GLM:
+
+Primero calcularemos la matriz de diseño:
+
+
+```{r, echo=TRUE, eval=TRUE}
+designmat <- model.matrix(~ 0 + dgList$samples$group)
+designmat
+colnames(designmat) <- levels(dgList$samples$group)
+```
+
+La dispersión común estima el BCV general del conjunto de datos, promediado sobre todos los genes.
+
+```{r, echo=TRUE, eval=TRUE}
+d2 <- estimateGLMCommonDisp(dgList,designmat)
+
+```
+
+Ahora haremos las estimaciones de dispersión delos genes:
+
+```{r, echo=TRUE, eval=TRUE}
+d2 <- estimateGLMCommonDisp(dgList,designmat)
+d2 <- estimateGLMTrendedDisp(d2,designmat)
+# podemos usar el metodo "auto", "bin.spline", "power", "spline", "bin.loess"
+
+d2 <- estimateGLMTagwiseDisp(d2,designmat)
+```
+
+Hacemos una gráfica de las dispersiones estimadas:
+
+```{r, echo=TRUE, eval=TRUE}
+plotBCV(d2)
+```
+
+#### Comparacion entre los modelos DESeq y edgeR
+
+Veamos los resultados usando DESeq:
+
+```{r, echo=TRUE, eval=TRUE}
+cds <- newCountDataSet(data.frame(dgList$counts), dgList$samples$group)
+cds <- estimateSizeFactors(cds)
+sizeFactors(cds)
+
+cds <- estimateDispersions( cds , method="blind")
+plotDispEsts(cds)
+```
+
+En este gráfico se traza la dispersión en el eje vertical en lugar del coeficiente de variación biológica.
+
+#### Expresión diferencial
+
+Una vez que se estiman las dispersiones, podemos proceder con los procedimientos de prueba para determinar la expresión diferencial. La función exactTest()lleva a cabo pruebas con etiquetas usando la prueba binomial negativa exacta. La topTags()función muestra los resultados de las pruebas para las n etiquetas más significativas . Por defecto, el algoritmo de Benjamini y Hochberg se usa para controlar los FDR.
+
+Primero lo haremos para d1 en el que solo habia una dispersión comun:
+
+```{r, echo=TRUE, eval=TRUE}
+et12 <- exactTest(d1, pair=c(1,2)) # compara grupos 1 y 2
+et13 <- exactTest(d1, pair=c(1,3)) # compara grupos 1 y 3
+et23 <- exactTest(d1, pair=c(2,3)) # compara grupos 2 y 3
+
+topTags(et12)
+topTags(et13)
+topTags(et23)
+```
+
+El número total de genes expresados diferencialmente en FDR <0.05 es:
+
+```{r, echo=TRUE, eval=TRUE}
+de12 <- decideTestsDGE(et12, adjust.method="BH", p.value=0.05)
+de13 <- decideTestsDGE(et13, adjust.method="BH", p.value=0.05)
+de23 <- decideTestsDGE(et23, adjust.method="BH", p.value=0.05)
+summary(de12)
+summary(de13)
+summary(de23)
+```
+
+Se nos muestran las etiquetas infraexpresadas, no expresadas diferencialmente y sobreexpresadas, respectivamente.
+
+```{r, echo=TRUE, eval=TRUE}
+de12tags12 <- rownames(d1)[as.logical(de12)]
+de13tags13 <- rownames(d1)[as.logical(de13)]
+de23tags23 <- rownames(d1)[as.logical(de23)]
+plotSmear(et12, de.tags=de12tags12)
+abline(h = c(-2, 2), col = "blue")
+plotSmear(et13, de.tags=de13tags13)
+abline(h = c(-2, 2), col = "blue")
+plotSmear(et23, de.tags=de23tags23)
+abline(h = c(-2, 2), col = "blue")
+```
+
+
+Ahora haremos la expresion diferencial con GLM (d2).
+
+Ajustamos el modelo lineal
+
+```{r, echo=TRUE, eval=TRUE}
+fit <- glmFit(d2, designmat)
+names(fit)
+head(coef(fit))
+```
+
+Realizamos las pruebas y le decimos que muestre los genes principales:
+
+```{r, echo=TRUE, eval=TRUE}
+lrt12 <- glmLRT(fit, contrast=c(1,-1,0))
+lrt13 <- glmLRT(fit, contrast=c(1,0,-1))
+lrt23 <- glmLRT(fit, contrast=c(0,1,-1))
+topTags(lrt12)
+topTags(lrt13)
+topTags(lrt23)
+```
+
+
+El número total de genes expresados diferencialmente en FDR <0.05 es:
+
+```{r, echo=TRUE, eval=TRUE}
+de2en <- decideTestsDGE(lrt12, adjust.method="BH", p.value = 0.05)
+de2es <- decideTestsDGE(lrt13, adjust.method="BH", p.value = 0.05)
+de2ns <- decideTestsDGE(lrt23, adjust.method="BH", p.value = 0.05)
+de2tagsen <- rownames(d2)[as.logical(de2en)]
+de2tagses <- rownames(d2)[as.logical(de2es)]
+de2tagsns <- rownames(d2)[as.logical(de2ns)]
+summary(de2en)
+summary(de2es)
+summary(de2ns)
+```
+
+
+Veamos ahora los graficos para cada contraste:
+
+
+```{r, echo=TRUE, eval=TRUE}
+
+plotSmear(lrt12, de.tags=de2tagsen)
+abline(h = c(-2, 2), col = "blue")
+
+plotSmear(lrt13, de.tags=de2tagses)
+abline(h = c(-2, 2), col = "blue")
+
+plotSmear(lrt23, de.tags=de2tagsns)
+abline(h = c(-2, 2), col = "blue")
+```
+
+
+```{r, echo=TRUE, eval=TRUE}
+results <- as.data.frame(topTags(lrt12,n = Inf))
+head(results)
+dim(results)
+
+results2 <- as.data.frame(topTags(lrt13,n = Inf))
+head(results2)
+dim(results2)
+
+results3 <- as.data.frame(topTags(lrt23,n = Inf))
+head(results3)
+dim(results3)
+```
+
+```{r, echo=TRUE, eval=TRUE}
+summary(de <- decideTestsDGE(lrt12,
+                             adjust.method="BH", p.value = 0.05))
+```
+
+
+```{r, echo=TRUE, eval=TRUE}
+save(lrt12,
+     lrt13,
+     lrt23,
+     dgList,grupos,file="C:/Pec2DatosOmicos/results/DE.Rdata")
+```
+
+#### Anotación y visualización de resultados
+
+Para anotar nuestros resultados, vamos a quedarnos con los símbolos genéticos y el nombre completo del gen. Separaremos la información de anotación en un marco de datos usando la funcion select.
+
+Ajunto el codigo de results2 y results3 en el apendice.
+
+```{r, echo=TRUE, eval=TRUE}
+ann <- select(org.Hs.eg.db,keys=rownames(results), keytype = "ENSEMBL",
+              columns=c("SYMBOL","GENENAME"))
+
+head(ann)
+dim(ann)
+
+```
+
+
+```{r, echo=FALSE, eval=TRUE}
+
+ann2 <- select(org.Hs.eg.db,keys=rownames(results2), keytype = "ENSEMBL",
+              columns=c("SYMBOL","GENENAME"))
+ann3 <- select(org.Hs.eg.db,keys=rownames(results3), keytype = "ENSEMBL",
+              columns=c("SYMBOL","GENENAME"))
+
+
+```
+
+Verifiquemos nuevamente que la columna ENSEMBL coincida exactamente con los nombres de las filas de results.
+
+
+```{r, echo=TRUE, eval=TRUE}
+table(unique(ann$ENSEMBL)==rownames(results))
+
+```
+
+
+```{r, echo=TRUE, eval=TRUE}
+# Tengo que hacer esto debido a la salida 'select()' returned 1:many...
+ann <- ann[!duplicated(ann$ENSEMBL), ] 
+results.annotated <- cbind(results, ann)
+
+head(results.annotated)
+
+```
+
+
+```{r, echo=FALSE, eval=TRUE}
+# Tengo que hacer esto debido a la salida 'select()' returned 1:many...
+ann2 <- ann2[!duplicated(ann2$ENSEMBL), ] 
+results.annotated2 <- cbind(results2, ann2)
+
+
+
+ann3 <- ann3[!duplicated(ann3$ENSEMBL), ] 
+results.annotated3 <- cbind(results3, ann3)
+
+
+
+```
+
+
+```{r, echo=TRUE, eval=TRUE}
+write.csv(results.annotated,file="C:/Pec2DatosOmicos/results/ELIVsNIT.csv",
+          row.names=FALSE)
+
+```
+
+```{r, echo=FALSE, eval=TRUE}
+write.csv(results.annotated2,file="C:/Pec2DatosOmicos/results/ELIVsSFI.csv",
+          row.names=FALSE)
+
+write.csv(results.annotated3,file="C:/Pec2DatosOmicos/results/NITVsSFI.csv",
+          row.names=FALSE)
+```
+
+
+Una alternativa es utilizar BioMart . BioMart es mucho más completo, pero los "organism packages" se ajustan mejor al flujo de trabajo de Bioconductor.
+
+Veamos también como queda representado con un VolcanoPlot:
+
+```{r, echo=TRUE, eval=TRUE}
+detags <- rownames(dgList)[as.logical(de)]
+signif <- -log10(results.annotated$FDR)
+plot(results.annotated$logFC,signif,pch=16)
+points(results.annotated[detags,"logFC"],-log10(results.annotated[detags,"FDR"]),pch=16,col="red")
+
+#ggplot(results, aes(x = logFC, y=-log10(FDR))) + geom_point()
+
+```
+
+
+```{r, echo=FALSE, eval=TRUE}
+detags <- rownames(dgList)[as.logical(de2es)]
+signif <- -log10(results.annotated$FDR)
+plot(results.annotated$logFC,signif,pch=16)
+points(results.annotated[detags,"logFC"],-log10(results.annotated[detags,"FDR"]),pch=16,col="red")
+
+#ggplot(results, aes(x = logFC, y=-log10(FDR))) + geom_point()
+
+detags <- rownames(dgList)[as.logical(de2ns)]
+signif <- -log10(results.annotated$FDR)
+plot(results.annotated$logFC,signif,pch=16)
+points(results.annotated[detags,"logFC"],-log10(results.annotated[detags,"FDR"]),pch=16,col="red")
+
+#ggplot(results, aes(x = logFC, y=-log10(FDR))) + geom_point()
+
+```
+
+
+Del mismo modo que hicimos anteriormente, podemos ver graficos interctivos con el paquete Glima (lo hago solo para la EvsN):
+
+
+```{r, echo=TRUE, eval=TRUE}
+normCounts <- dgList$counts
+glXYPlot(x=results$logFC, y=-log10(results$FDR),
+         xlab="logFC", ylab="B", main="EVsN",
+         counts=normCounts, groups=grupos, status=de,
+         id.column="ENSEMBL", folder="volcano")
+
+```
+
+```{r , echo=FALSE, fig.cap="Diagrama MDS interactivo", out.width = '100%'}
+knitr::include_graphics("C:/Pec2DatosOmicos/results/Glima2.png")
+```
+
+Se podrian hacer más cosas, como  recuperar las ubicaciones genomicas, manipular los intervalos genomicos con GenomicRangers, exportar pistas o extraer lecturas.
+
+#### Significación biologica
+
+GOseq es un método para realizar análisis de ontología génica (GO) adecuado para datos de RNA-seq, ya que explica el sesgo de la longitud del gen en la detección de sobrerepresentación.
+
+
+
+```{r, echo=TRUE, eval=TRUE}
+# lista de DEGs filtrando con FDR
+genes <- results$FDR < 0.05
+
+
+
+# Añadimos nombres
+names(genes) <- rownames(results)
+print(head(genes))
+```
+
+```{r, echo=FALSE, eval=TRUE}
+# lista de DEGs filtrando con FDR
+genes2 <- results2$FDR < 0.01
+
+# Añadimos nombres
+names(genes2) <- rownames(results2)
+
+```
+
+```{r, echo=FALSE, eval=TRUE}
+# lista de DEGs filtrando con FDR
+genes3 <- results3$FDR < 0.01
+
+# Añadimos nombres
+names(genes3) <- rownames(results3)
+
+```
+
+
+Calcularemos una función de ponderación de probabilidad o PWF que puede considerarse como una función que da la probabilidad de que un gen se exprese diferencialmente (DE), basándose solo en su longitud.
+
+```{r, echo=TRUE, eval=TRUE}
+supportedOrganisms()[supportedOrganisms()$Genome=="hg19",]
+pwf <- nullp(genes, "hg19", "ensGene")
+head(pwf)
+
+```
+
+```{r, echo=FALSE, eval=TRUE}
+pwf2 <- nullp(genes2, "hg19", "ensGene")
+
+```
+
+```{r, echo=FALSE, eval=TRUE}
+pwf3 <- nullp(genes3, "hg19", "ensGene")
+
+```
+
+
+```{r, echo=TRUE, eval=TRUE}
+write.csv(results.annotated,file="C:/Pec2DatosOmicos/results/pwf.tsv",
+          row.names=FALSE)
+```
+
+```{r, echo=FALSE, eval=TRUE}
+write.csv(results.annotated,file="C:/Pec2DatosOmicos/results/pwf2.tsv",
+          row.names=FALSE)
+write.csv(results.annotated,file="C:/Pec2DatosOmicos/results/pwf3.tsv",
+          row.names=FALSE)
+
+```
+
+Las gráficas salen diferente a todas las que he visto en diferentes documentos, no se si es debido a algun fallo en el analisis, o que el ajuste es malo.
+
+He probado a hacerlo de esta otra forma, y se obtiene el mismo resultado:
+
+
+```{r, echo=TRUE, eval=FALSE}
+geness =as.integer(p.adjust(et12$table$PValue[et12$table$logFC!=0],
+                               method="BH")<.05)
+                               names(geness)=row.names(et12$table[et12$table$logFC!=0,])
+pwff <- nullp(geness, "hg19", "ensGene")                               
+```
+
+
+Realizamos un análisis de enriquecimiento del conjunto de genes:
+
+```{r, echo=TRUE, eval=TRUE}
+go.results <- goseq(pwf, "hg19", "ensGene")
+head(go.results)
+enriched.GO=go.results$category[p.adjust(go.results$over_represented_pvalue,
+                                      method="BH")<.05]
+
+head(enriched.GO)
+
+```
+
+Categorías GO relacionadas:
+
+```{r, echo=TRUE, eval=TRUE}
+
+for(go in enriched.GO[1:5]){
+  print(GOTERM[[go]])
+  cat("--------------------------------------\n")
+  }
+```
+
+También podriamos haber hecho el analisis de significación biologica con la herramienta en linea Enrich, para lo cual necesitariamos subir a la plataforma de Enrich el archivo con las anotaciones de los genes.
+
+El paquete fgsea que aleatoriza reiteradamente las etiquetas de las muestras y vuelve a realizar pruebas de enriquecimiento en las clases aleatorias.
+
+# Resultados
+
+Aqui se mostrara una lista de archivos generados en el estudio de caso actual.
+
+```{r, echo=TRUE, eval=TRUE}
+listOfFiles <- dir("./results/") 
+knitr::kable(
+  listOfFiles, booktabs = TRUE,
+  caption = 'List of files generated in the analysis',
+  col.names="List_of_Files"
+)
+```
+
+# Apendice
+
+## Anotación y visualización de resultados
+
+
+```{r, echo=TRUE, eval=FALSE}
+
+ann2 <- select(org.Hs.eg.db,keys=rownames(results2), keytype = "ENSEMBL",
+              columns=c("SYMBOL","GENENAME"))
+ann3 <- select(org.Hs.eg.db,keys=rownames(results3), keytype = "ENSEMBL",
+              columns=c("SYMBOL","GENENAME"))
+
+
+```
+
+Verifiquemos nuevamente que la columna ENSEMBL coincida exactamente con los nombres de las filas de results.
+
+
+```{r, echo=TRUE, eval=FALSE}
+# Tengo que hacer esto debido a la salida 'select()' returned 1:many...
+ann2 <- ann2[!duplicated(ann2$ENSEMBL), ] 
+results.annotated2 <- cbind(results2, ann2)
+
+
+
+ann3 <- ann3[!duplicated(ann3$ENSEMBL), ] 
+results.annotated3 <- cbind(results3, ann3)
+
+
+
+```
+
+
+```{r, echo=TRUE, eval=FALSE}
+detags <- rownames(dgList)[as.logical(de2es)]
+signif <- -log10(results.annotated$FDR)
+plot(results.annotated$logFC,signif,pch=16)
+points(results.annotated[detags,"logFC"],-log10(results.annotated[detags,"FDR"]),pch=16,col="red")
+
+#ggplot(results, aes(x = logFC, y=-log10(FDR))) + geom_point()
+
+detags <- rownames(dgList)[as.logical(de2ns)]
+signif <- -log10(results.annotated$FDR)
+plot(results.annotated$logFC,signif,pch=16)
+points(results.annotated[detags,"logFC"],-log10(results.annotated[detags,"FDR"]),pch=16,col="red")
+
+#ggplot(results, aes(x = logFC, y=-log10(FDR))) + geom_point()
+
+```
+
+## Significación biologica
+
+
+```{r, echo=TRUE, eval=FALSE}
+# lista de DEGs filtrando con FDR
+genes2 <- results2$FDR < 0.01
+
+# Añadimos nombres
+names(genes2) <- rownames(results2)
+
+print(head(genes2))
+```
+
+```{r, echo=TRUE, eval=FALSE}
+# lista de DEGs filtrando con FDR
+genes3 <- results3$FDR < 0.01
+
+# Añadimos nombres
+names(genes3) <- rownames(results3)
+
+print(head(genes3))
+```
+
+
+```{r, echo=TRUE, eval=FALSE}
+pwf2 <- nullp(genes2, "hg19", "ensGene")
+head(pwf2)
+```
+
+```{r, echo=TRUE, eval=FALSE}
+pwf3 <- nullp(genes3, "hg19", "ensGene")
+head(pwf3)
+```
+
+
+```{r, echo=TRUE, eval=FALSE}
+write.csv(results.annotated,file="C:/Pec2DatosOmicos/results/pwf2.tsv",
+          row.names=FALSE)
+write.csv(results.annotated,file="C:/Pec2DatosOmicos/results/pwf3.tsv",
+          row.names=FALSE)
+
+```
+
+
+```{r, echo=TRUE, eval=TRUE}
+go.results2 <- goseq(pwf2, "hg19", "ensGene")
+head(go.results2)
+enriched.GO2=go.results2$category[p.adjust(go.results2$over_represented_pvalue,
+                                      method="BH")<.05]
+
+head(enriched.GO2)
+
+```
+
+Categorías GO relacionadas:
+
+```{r, echo=TRUE, eval=TRUE}
+
+for(go in enriched.GO2[1:5]){
+  print(GOTERM[[go]])
+  cat("--------------------------------------\n")
+  }
+```
+
+
+```{r, echo=TRUE, eval=TRUE}
+go.results3 <- goseq(pwf3, "hg19", "ensGene")
+head(go.results3)
+enriched.GO3=go.results3$category[p.adjust(go.results3$over_represented_pvalue,
+                                      method="BH")<.05]
+
+head(enriched.GO3)
+
+```
+
+Categorías GO relacionadas:
+
+```{r, echo=TRUE, eval=TRUE}
+
+for(go in enriched.GO3[1:5]){
+  print(GOTERM[[go]])
+  cat("--------------------------------------\n")
+  }
+```
